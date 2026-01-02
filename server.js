@@ -643,6 +643,83 @@ app.post('/api/webhook/github', verifyGitHubWebhook, async (req, res) => {
 });
 
 // ============================================
+// ACTIVITY LOG (Live Trading Feed)
+// ============================================
+
+// In-memory store for last 100 log entries
+const activityLog = {
+  entries: [],
+  maxEntries: 100
+};
+
+// POST /api/activity-log - Receive logs from Alpha Hunter
+app.post('/api/activity-log', async (req, res) => {
+  const { logs } = req.body;
+  
+  if (!logs || !Array.isArray(logs)) {
+    return res.status(400).json({ error: 'logs array required' });
+  }
+  
+  // Add new logs
+  for (const log of logs) {
+    activityLog.entries.unshift({
+      id: Date.now() + Math.random(),
+      timestamp: log.timestamp || new Date().toISOString(),
+      type: log.type || 'info', // trade, analysis, error, info
+      message: log.message || '',
+      data: log.data || null,
+      receivedAt: new Date().toISOString()
+    });
+  }
+  
+  // Trim to max entries
+  if (activityLog.entries.length > activityLog.maxEntries) {
+    activityLog.entries = activityLog.entries.slice(0, activityLog.maxEntries);
+  }
+  
+  // Also save to Supabase for persistence (optional, async)
+  try {
+    if (logs.length > 0) {
+      await supabase.from('activity_log').insert(
+        logs.map(log => ({
+          timestamp: log.timestamp || new Date().toISOString(),
+          log_type: log.type || 'info',
+          message: log.message || '',
+          data: log.data || null
+        }))
+      ).catch(() => {}); // Don't fail if table doesn't exist
+    }
+  } catch (e) {
+    // Silently ignore Supabase errors - memory log still works
+  }
+  
+  res.json({ 
+    success: true, 
+    received: logs.length,
+    totalInMemory: activityLog.entries.length
+  });
+});
+
+// GET /api/activity-log - Get recent logs
+app.get('/api/activity-log', (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const since = req.query.since; // ISO timestamp
+  
+  let entries = activityLog.entries;
+  
+  // Filter by timestamp if provided
+  if (since) {
+    entries = entries.filter(e => new Date(e.timestamp) > new Date(since));
+  }
+  
+  res.json({
+    count: entries.slice(0, limit).length,
+    total: activityLog.entries.length,
+    logs: entries.slice(0, limit)
+  });
+});
+
+// ============================================
 // NOTIFICATIONS
 // ============================================
 
@@ -665,7 +742,7 @@ app.get('/dashboard', (req, res) => {
 app.get('/dashboard.html', dashboardAuth, async (req, res) => {
   const key = req.query.key || '';
   
-  // Serve a simple dashboard
+  // Serve a simple dashboard with live feed
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -674,26 +751,173 @@ app.get('/dashboard.html', dashboardAuth, async (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    body { background: #0f172a; color: white; }
+    body { background: #0f172a; color: white; font-family: 'Monaco', 'Menlo', monospace; }
     .pulse { animation: pulse 2s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .log-trade { color: #22c55e; }
+    .log-analysis { color: #eab308; }
+    .log-error { color: #ef4444; }
+    .log-info { color: #3b82f6; }
+    .log-sync { color: #a855f7; }
+    #liveFeed {
+      max-height: 400px;
+      overflow-y: auto;
+      scroll-behavior: smooth;
+    }
+    #liveFeed::-webkit-scrollbar { width: 6px; }
+    #liveFeed::-webkit-scrollbar-track { background: #1e293b; }
+    #liveFeed::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+    .log-entry { 
+      border-left: 3px solid transparent;
+      transition: all 0.2s;
+    }
+    .log-entry:hover { background: #1e293b; }
+    .log-entry.log-trade { border-left-color: #22c55e; }
+    .log-entry.log-analysis { border-left-color: #eab308; }
+    .log-entry.log-error { border-left-color: #ef4444; }
+    .new-entry { animation: slideIn 0.3s ease-out; }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
   </style>
 </head>
 <body class="p-4">
   <div class="flex justify-between items-center mb-4">
-    <h1 class="text-2xl font-bold">☁️ AI Empire Cloud Orchestrator</h1>
-    <div id="killSwitch" class="text-sm"></div>
+    <h1 class="text-xl font-bold">☁️ AI Empire Dashboard</h1>
+    <div class="flex items-center gap-4">
+      <div id="killSwitch" class="text-sm"></div>
+      <button id="feedToggle" onclick="toggleFeed()" class="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">
+        📺 Live Feed
+      </button>
+    </div>
   </div>
-  <div id="status" class="grid grid-cols-2 md:grid-cols-4 gap-4">Loading...</div>
-  <div class="mt-4">
-    <h2 class="text-lg font-bold mb-2">📋 Recent Tasks</h2>
-    <div id="tasks" class="text-sm text-gray-400">Loading...</div>
+  
+  <!-- Status Cards -->
+  <div id="status" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">Loading...</div>
+  
+  <!-- Live Trading Feed -->
+  <div id="feedContainer" class="mb-4">
+    <div class="flex justify-between items-center mb-2">
+      <h2 class="text-lg font-bold">📡 Alpha Hunter Live Feed</h2>
+      <div class="flex items-center gap-2">
+        <span id="feedStatus" class="text-xs text-green-400">● Connected</span>
+        <button onclick="clearFeed()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">Clear</button>
+      </div>
+    </div>
+    <div id="liveFeed" class="bg-gray-900 rounded-lg p-3 font-mono text-xs">
+      <div class="text-gray-500">Waiting for activity...</div>
+    </div>
   </div>
-  <div class="mt-4 text-xs text-gray-600">
-    Last updated: <span id="lastUpdate">-</span>
+  
+  <!-- Quick Stats -->
+  <div id="quickStats" class="grid grid-cols-4 gap-3 mb-4">
+    <div class="bg-gray-800 p-3 rounded text-center">
+      <div class="text-2xl font-bold text-green-400" id="statTrades">0</div>
+      <div class="text-xs text-gray-400">Trades</div>
+    </div>
+    <div class="bg-gray-800 p-3 rounded text-center">
+      <div class="text-2xl font-bold text-yellow-400" id="statAnalysis">0</div>
+      <div class="text-xs text-gray-400">Analysis</div>
+    </div>
+    <div class="bg-gray-800 p-3 rounded text-center">
+      <div class="text-2xl font-bold text-red-400" id="statErrors">0</div>
+      <div class="text-xs text-gray-400">Errors</div>
+    </div>
+    <div class="bg-gray-800 p-3 rounded text-center">
+      <div class="text-2xl font-bold text-blue-400" id="statTotal">0</div>
+      <div class="text-xs text-gray-400">Total</div>
+    </div>
   </div>
+  
+  <div class="text-xs text-gray-600">
+    Last updated: <span id="lastUpdate">-</span> | 
+    <a href="#" onclick="location.reload()" class="text-blue-500">Refresh</a>
+  </div>
+  
   <script>
     const API_KEY = '${key}';
+    let feedVisible = true;
+    let lastLogId = null;
+    let stats = { trades: 0, analysis: 0, errors: 0, total: 0 };
+    
+    function toggleFeed() {
+      feedVisible = !feedVisible;
+      document.getElementById('feedContainer').style.display = feedVisible ? 'block' : 'none';
+      document.getElementById('feedToggle').textContent = feedVisible ? '📺 Hide Feed' : '📺 Show Feed';
+    }
+    
+    function clearFeed() {
+      document.getElementById('liveFeed').innerHTML = '<div class="text-gray-500">Feed cleared...</div>';
+      stats = { trades: 0, analysis: 0, errors: 0, total: 0 };
+      updateStats();
+    }
+    
+    function updateStats() {
+      document.getElementById('statTrades').textContent = stats.trades;
+      document.getElementById('statAnalysis').textContent = stats.analysis;
+      document.getElementById('statErrors').textContent = stats.errors;
+      document.getElementById('statTotal').textContent = stats.total;
+    }
+    
+    function getLogIcon(type) {
+      switch(type) {
+        case 'trade': return '💰';
+        case 'analysis': return '🤖';
+        case 'error': return '❌';
+        case 'sync': return '📡';
+        case 'market': return '📊';
+        default: return 'ℹ️';
+      }
+    }
+    
+    function formatTime(isoString) {
+      return new Date(isoString).toLocaleTimeString('en-US', { 
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false 
+      });
+    }
+    
+    async function loadFeed() {
+      try {
+        const res = await fetch('/api/activity-log?limit=50', {
+          headers: { 'x-admin-key': API_KEY }
+        });
+        const data = await res.json();
+        
+        if (data.logs && data.logs.length > 0) {
+          const feed = document.getElementById('liveFeed');
+          const newLogs = lastLogId ? data.logs.filter(l => l.id > lastLogId) : data.logs;
+          
+          if (newLogs.length > 0 || !lastLogId) {
+            // Build HTML for logs
+            const logsHtml = data.logs.slice(0, 50).map(log => {
+              const isNew = lastLogId && log.id > lastLogId;
+              return \`<div class="log-entry log-\${log.type} py-1 px-2 \${isNew ? 'new-entry' : ''}">
+                <span class="text-gray-500">[\${formatTime(log.timestamp)}]</span>
+                \${getLogIcon(log.type)} \${log.message}
+              </div>\`;
+            }).join('');
+            
+            feed.innerHTML = logsHtml || '<div class="text-gray-500">No activity yet...</div>';
+            
+            // Update stats
+            stats.total = data.total;
+            stats.trades = data.logs.filter(l => l.type === 'trade').length;
+            stats.analysis = data.logs.filter(l => l.type === 'analysis').length;
+            stats.errors = data.logs.filter(l => l.type === 'error').length;
+            updateStats();
+            
+            // Track last log ID for new entries
+            if (data.logs.length > 0) {
+              lastLogId = Math.max(...data.logs.map(l => l.id));
+            }
+          }
+          
+          document.getElementById('feedStatus').innerHTML = '● Connected';
+          document.getElementById('feedStatus').className = 'text-xs text-green-400';
+        }
+      } catch (e) {
+        document.getElementById('feedStatus').innerHTML = '● Disconnected';
+        document.getElementById('feedStatus').className = 'text-xs text-red-400';
+      }
+    }
     
     async function load() {
       try {
@@ -703,19 +927,18 @@ app.get('/dashboard.html', dashboardAuth, async (req, res) => {
         const data = await res.json();
         
         document.getElementById('status').innerHTML = data.agents.map(a => \`
-          <div class="bg-gray-800 p-4 rounded-lg border-l-4 \${
+          <div class="bg-gray-800 p-3 rounded-lg border-l-4 \${
             a.status === 'online' ? 'border-green-500' : 
             a.status === 'offline' ? 'border-red-500' : 'border-yellow-500'
           }">
             <div class="flex justify-between items-center">
-              <h2 class="font-bold capitalize">\${a.name}</h2>
-              <span class="text-xs px-2 py-1 rounded \${
+              <h2 class="font-bold capitalize text-sm">\${a.name}</h2>
+              <span class="text-xs px-2 py-0.5 rounded \${
                 a.status === 'online' ? 'bg-green-600' : 
                 a.status === 'offline' ? 'bg-red-600' : 'bg-yellow-600'
               }">\${a.status}</span>
             </div>
-            <div class="text-sm text-gray-400 mt-1">Pending: \${a.pendingTasks}</div>
-            <div class="text-xs text-gray-500 mt-1">\${a.projects === 'ALL' ? 'All projects' : a.projects?.slice(0,2).join(', ') + '...'}</div>
+            <div class="text-xs text-gray-400 mt-1">Tasks: \${a.pendingTasks}</div>
           </div>
         \`).join('');
         
@@ -724,21 +947,22 @@ app.get('/dashboard.html', dashboardAuth, async (req, res) => {
         });
         const killData = await killRes.json();
         document.getElementById('killSwitch').innerHTML = killData.killSwitch 
-          ? '<span class="bg-red-600 px-2 py-1 rounded pulse">🛑 KILLED</span>'
-          : '<span class="bg-green-600 px-2 py-1 rounded">✅ Active</span> ' + 
-            '<span class="text-gray-500">(' + killData.counters.today + ' req today)</span>';
-        
-        document.getElementById('tasks').innerHTML = data.recentCompletions?.slice(0,3).map(t =>
-          \`<div class="bg-gray-800 p-2 rounded mb-1">\${t.task_id}: \${t.description?.slice(0,50)}...</div>\`
-        ).join('') || 'No recent tasks';
+          ? '<span class="bg-red-600 px-2 py-1 rounded pulse text-xs">🛑 KILLED</span>'
+          : '<span class="bg-green-600 px-2 py-1 rounded text-xs">✅</span>';
         
         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
       } catch (e) {
-        document.getElementById('status').innerHTML = '<div class="text-red-500">Error: ' + e.message + '</div>';
+        document.getElementById('status').innerHTML = '<div class="text-red-500 col-span-4">Error: ' + e.message + '</div>';
       }
     }
+    
+    // Initial load
     load();
-    setInterval(load, 10000);
+    loadFeed();
+    
+    // Refresh intervals
+    setInterval(load, 10000);     // Status every 10s
+    setInterval(loadFeed, 5000);  // Feed every 5s
   </script>
 </body>
 </html>
