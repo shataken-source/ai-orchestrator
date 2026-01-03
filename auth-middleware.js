@@ -32,6 +32,7 @@ const AUTH_CONFIG = {
     '/health',
     '/api/webhook/voice',      // Alexa/Google need to reach this
     '/api/webhook/github',     // GitHub webhooks
+    '/api/webhook/sinch',      // Sinch SMS inbound webhook
   ],
   
   // Webhook secrets (for signed requests)

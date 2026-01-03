@@ -21,6 +21,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const cron = require('node-cron');
 
 // Kill switch and rate limiting
 const {
@@ -720,6 +722,262 @@ app.get('/api/activity-log', (req, res) => {
 });
 
 // ============================================
+// SMS INBOUND WEBHOOK (Sinch)
+// ============================================
+
+app.post('/api/webhook/sinch', async (req, res) => {
+  try {
+    const payload = req.body;
+    
+    console.log('[Sinch Webhook] Received:', JSON.stringify(payload));
+    
+    // Extract sender and message (Sinch can use different field names)
+    const sender = payload.from || payload.from_ || payload.sender || '';
+    const body = (payload.body || payload.text || payload.message || '').trim().toUpperCase();
+    
+    if (!sender || !body) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing sender or message body'
+      });
+    }
+    
+    // Log the incoming message
+    console.log(`[Sinch Webhook] SMS from ${sender}: ${body}`);
+    
+    // Verify sender is authorized (Jason, Victoria, or Navid)
+    const authorizedNumbers = [
+      process.env.MY_PHONE_NUMBER,
+      process.env.VICTORIA_PHONE,
+      process.env.NAVID_PHONE
+    ].filter(Boolean);
+    
+    if (!authorizedNumbers.includes(sender)) {
+      console.log(`[Sinch Webhook] Unauthorized sender: ${sender}`);
+      return res.json({
+        success: false,
+        message: 'Unauthorized sender'
+      });
+    }
+    
+    // Process commands
+    let response = { success: true, action: null, message: '' };
+    
+    // GOTIT - Guardian Pulse check-in
+    if (body === 'GOTIT' || body === 'GOT IT') {
+      // Reset Guardian timer (if Guardian Pulse is active)
+      response.action = 'guardian_checkin';
+      response.message = 'Check-in confirmed, timer reset';
+      console.log('[Sinch Webhook] ✅ Guardian check-in confirmed');
+    }
+    // STATUS - Get system status
+    else if (body === 'STATUS' || body === 'STAT') {
+      const counters = getCounters();
+      const { data: claudeTasks } = await supabase
+        .from('inbox_tasks')
+        .select('id')
+        .eq('assigned_to', 'claude')
+        .eq('status', 'pending');
+      
+      const { data: geminiTasks } = await supabase
+        .from('inbox_tasks')
+        .select('id')
+        .eq('assigned_to', 'gemini')
+        .eq('status', 'pending');
+      
+      response.action = 'status_request';
+      response.message = `System OK. Claude: ${claudeTasks?.length || 0} tasks, Gemini: ${geminiTasks?.length || 0} tasks. Requests today: ${counters.requests.today}`;
+    }
+    // STOP - Emergency stop
+    else if (body === 'STOP' || body === 'EMERGENCY') {
+      // Trigger kill switch
+      const killSwitchResult = await supabase
+        .from('kill_switch_events')
+        .insert({
+          triggered_by: sender,
+          reason: 'SMS command: STOP',
+          triggered_at: new Date().toISOString()
+        });
+      
+      response.action = 'kill_switch_activated';
+      response.message = 'Emergency stop activated via SMS';
+      console.log('[Sinch Webhook] 🚨 EMERGENCY STOP activated via SMS');
+    }
+    // HELP - Show available commands
+    else if (body === 'HELP' || body === '?') {
+      response.action = 'help';
+      response.message = 'Commands: GOTIT (check-in), STATUS (system status), STOP (emergency), HELP (this message)';
+    }
+    // Unknown command - try to parse as task command
+    else {
+      // Try to parse as a command for an AI
+      const parsed = parseCommand(body, 'claude');
+      const taskId = `SMS-${parsed.to.toUpperCase()}-${Date.now()}`;
+      
+      await supabase.from('inbox_tasks').insert({
+        task_id: taskId,
+        assigned_to: parsed.to.toLowerCase(),
+        from_ai: 'human',
+        task_type: parsed.type,
+        priority: 'HIGH',
+        description: body,
+        source: 'sms',
+        status: 'pending'
+      });
+      
+      response.action = 'task_created';
+      response.message = `Command sent to ${parsed.to}: "${body}"`;
+      console.log(`[Sinch Webhook] Created task ${taskId} for ${parsed.to}`);
+    }
+    
+    // Send confirmation SMS back (optional)
+    if (process.env.SINCH_API_TOKEN && process.env.SINCH_SERVICE_PLAN_ID) {
+      try {
+        await sendCevictBriefing(sender, `✅ ${response.message}`);
+      } catch (e) {
+        console.error('[Sinch Webhook] Failed to send confirmation:', e.message);
+      }
+    }
+    
+    res.json(response);
+  } catch (error) {
+    console.error('[Sinch Webhook] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Webhook processing failed'
+    });
+  }
+});
+
+// ============================================
+// SMS TEST ENDPOINT
+// ============================================
+
+app.post('/api/test/sms', authMiddleware, async (req, res) => {
+  const phoneNumber = req.body.phone || process.env.MY_PHONE_NUMBER;
+  const customMessage = req.body.message;
+
+  if (!phoneNumber) {
+    return res.status(400).json({ 
+      error: 'Phone number required. Set MY_PHONE_NUMBER env var or pass in body.' 
+    });
+  }
+
+  if (!process.env.SINCH_API_TOKEN || !process.env.SINCH_SERVICE_PLAN_ID) {
+    return res.status(500).json({ 
+      error: 'SMS not configured. Missing SINCH_API_TOKEN or SINCH_SERVICE_PLAN_ID.' 
+    });
+  }
+
+  try {
+    const briefingText = customMessage || await generateDailyBriefing();
+    const result = await sendCevictBriefing(phoneNumber, briefingText);
+
+    if (result.success) {
+      res.json({
+        success: true,
+        message: 'SMS sent successfully',
+        batchId: result.batchId,
+        phoneNumber: phoneNumber,
+        textPreview: briefingText.substring(0, 100) + '...'
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to send SMS',
+        details: result.error
+      });
+    }
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// SMS SERVICE (Sinch)
+// ============================================
+
+async function sendCevictBriefing(phoneNumber, briefingText) {
+  const url = `https://sms.api.sinch.com/xms/v1/${process.env.SINCH_SERVICE_PLAN_ID}/batches`;
+  
+  try {
+    const response = await axios.post(url, {
+      from: process.env.SINCH_NUMBER || process.env.SINCH_FROM,
+      to: [phoneNumber],
+      body: briefingText
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.SINCH_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    console.log("✅ Briefing Sent via Sinch:", response.data.id);
+    return { success: true, batchId: response.data.id };
+  } catch (error) {
+    console.error("❌ SMS Failure:", error.response ? error.response.data : error.message);
+    return { success: false, error: error.response ? error.response.data : error.message };
+  }
+}
+
+async function generateDailyBriefing() {
+  try {
+    // Get today's trading summary
+    const { data: trades } = await supabase
+      .from('trade_history')
+      .select('*')
+      .gte('opened_at', new Date().toISOString().split('T')[0])
+      .order('opened_at', { ascending: false })
+      .limit(10);
+
+    // Get pending tasks count
+    const { data: claudeTasks } = await supabase
+      .from('inbox_tasks')
+      .select('id')
+      .eq('assigned_to', 'claude')
+      .eq('status', 'pending');
+
+    const { data: geminiTasks } = await supabase
+      .from('inbox_tasks')
+      .select('id')
+      .eq('assigned_to', 'gemini')
+      .eq('status', 'pending');
+
+    const date = new Date().toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+
+    let briefing = `📊 CEVICT DAILY BRIEFING - ${date}\n\n`;
+    
+    briefing += `🤖 AI STATUS:\n`;
+    briefing += `   Claude: ${claudeTasks?.length || 0} pending tasks\n`;
+    briefing += `   Gemini: ${geminiTasks?.length || 0} pending tasks\n\n`;
+
+    if (trades && trades.length > 0) {
+      const totalPnL = trades.reduce((sum, t) => sum + (parseFloat(t.pnl) || 0), 0);
+      briefing += `💰 TRADING:\n`;
+      briefing += `   Trades today: ${trades.length}\n`;
+      briefing += `   P/L: $${totalPnL.toFixed(2)}\n\n`;
+    } else {
+      briefing += `💰 TRADING: No trades today\n\n`;
+    }
+
+    briefing += `🌐 SYSTEM: All services operational\n`;
+    briefing += `📡 Dashboard: https://ai-orchestrator-production-7bbf.up.railway.app/dashboard.html`;
+
+    return briefing;
+  } catch (error) {
+    console.error("Error generating briefing:", error);
+    return `📊 CEVICT DAILY BRIEFING\n\nSystem operational. Check dashboard for details.`;
+  }
+}
+
+// ============================================
 // NOTIFICATIONS
 // ============================================
 
@@ -1005,7 +1263,46 @@ app.listen(CONFIG.PORT, () => {
   console.log('   POST /api/heartbeat         - Bot health check');
   console.log('   POST /api/webhook/voice     - Alexa/Google (public)');
   console.log('   POST /api/webhook/github    - GitHub events (verified)');
+  console.log('   POST /api/webhook/sinch     - Sinch SMS inbound (public)');
   console.log('   GET  /api/kill-switch/status - Cost monitoring');
   console.log('   GET  /dashboard.html?key=X  - Dashboard (protected)');
+  console.log('   POST /api/test/sms          - Test SMS briefing');
   console.log('═══════════════════════════════════════════════════════════');
+  
+  // ============================================
+  // CRON JOBS
+  // ============================================
+  
+  // Daily briefing at 08:00 CST (14:00 UTC)
+  if (process.env.SINCH_API_TOKEN && process.env.MY_PHONE_NUMBER) {
+    cron.schedule('0 14 * * *', async () => {
+      console.log('📱 [CRON] Sending daily briefing SMS...');
+      const briefing = await generateDailyBriefing();
+      const result = await sendCevictBriefing(process.env.MY_PHONE_NUMBER, briefing);
+      if (result.success) {
+        console.log('✅ Daily briefing sent successfully');
+      } else {
+        console.error('❌ Failed to send daily briefing:', result.error);
+      }
+    }, {
+      timezone: "America/Chicago" // CST timezone
+    });
+    console.log('   📱 SMS Cron: Daily briefing scheduled for 08:00 CST');
+  } else {
+    console.log('   ⚠️  SMS Cron: Not configured (missing SINCH_API_TOKEN or MY_PHONE_NUMBER)');
+  }
+  
+  // ============================================
+  // PET MATCH ENGINE (24/7)
+  // ============================================
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
+    try {
+      const { startMatchEngine } = require('./match-engine');
+      startMatchEngine();
+    } catch (error) {
+      console.log('   ⚠️  Pet Match Engine: Not available (missing dependencies)');
+    }
+  } else {
+    console.log('   ⚠️  Pet Match Engine: Not configured (missing Supabase credentials)');
+  }
 });
