@@ -770,6 +770,9 @@ app.get('/dashboard.html', dashboardAuth, async (req, res) => {
     .log-entry { 
       border-left: 3px solid transparent;
       transition: all 0.2s;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+      line-height: 1.4;
     }
     .log-entry:hover { background: #1e293b; }
     .log-entry.log-trade { border-left-color: #22c55e; }
