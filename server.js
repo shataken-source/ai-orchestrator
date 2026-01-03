@@ -1912,3 +1912,5 @@ app.listen(CONFIG.PORT, () => {
     console.log('   ⚠️  Pet Match Engine: Not configured (missing Supabase credentials)');
   }
 });
+
+// Redeploy trigger: 2026-01-03 16:43:51
