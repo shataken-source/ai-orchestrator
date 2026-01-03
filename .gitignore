@@ -2,3 +2,19 @@
 # Large installers
 *.exe
 GoogleDriveSetup.exe
+
+# Deployment scripts with secrets (use env vars instead)
+*-set-vars.ps1
+*-DEPLOY-*.ps1
+DEPLOY-*.ps1
+CREATE-TABLES*.ps1
+deploy-schema.js
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Sensitive docs
+*CHECKLIST*.md
+RAILWAY_DEPLOY.md
