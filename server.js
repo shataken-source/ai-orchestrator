@@ -897,6 +897,60 @@ app.post('/api/test/sms', authMiddleware, async (req, res) => {
 });
 
 // ============================================
+// SPORTS PICKS TEST ENDPOINT
+// ============================================
+
+app.post('/api/test/picks', authMiddleware, async (req, res) => {
+  const phoneNumber = req.body.phone || process.env.MY_PHONE_NUMBER;
+
+  if (!phoneNumber) {
+    return res.status(400).json({ 
+      error: 'Phone number required. Set MY_PHONE_NUMBER env var or pass in body.' 
+    });
+  }
+
+  if (!process.env.SINCH_API_TOKEN || !process.env.SINCH_SERVICE_PLAN_ID) {
+    return res.status(500).json({ 
+      error: 'SMS not configured. Missing SINCH_API_TOKEN or SINCH_SERVICE_PLAN_ID.' 
+    });
+  }
+
+  try {
+    console.log('🎯 Generating sports picks for test...');
+    const picksMessage = await generateDailySportsPicks();
+    
+    if (!picksMessage) {
+      return res.json({
+        success: false,
+        message: 'No picks available to send',
+        note: 'Either no high-confidence picks today or database query failed'
+      });
+    }
+
+    const result = await sendCevictBriefing(phoneNumber, picksMessage);
+
+    if (result.success) {
+      res.json({
+        success: true,
+        message: 'Sports picks SMS sent successfully!',
+        batchId: result.batchId,
+        phoneNumber: phoneNumber,
+        textPreview: picksMessage.substring(0, 200) + '...'
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to send SMS',
+        details: result.error
+      });
+    }
+  } catch (error) {
+    console.error('Error in /api/test/picks:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // SMS SERVICE (Sinch)
 // ============================================
 
@@ -974,6 +1028,107 @@ async function generateDailyBriefing() {
   } catch (error) {
     console.error("Error generating briefing:", error);
     return `📊 CEVICT DAILY BRIEFING\n\nSystem operational. Check dashboard for details.`;
+  }
+}
+
+// ============================================
+// DAILY SPORTS PICKS GENERATOR
+// ============================================
+
+async function generateDailySportsPicks() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const MIN_CONFIDENCE = 70;
+    let picks = [];
+
+    // Query bot_predictions for sports picks
+    const { data: kalshiPicks, error: kalshiError } = await supabase
+      .from('bot_predictions')
+      .select('*')
+      .eq('platform', 'kalshi')
+      .gte('confidence', MIN_CONFIDENCE)
+      .gte('predicted_at', `${today}T00:00:00Z`)
+      .lt('predicted_at', `${today}T23:59:59Z`)
+      .order('confidence', { ascending: false })
+      .limit(10);
+
+    if (!kalshiError && kalshiPicks) {
+      picks = picks.concat(kalshiPicks.filter(p => 
+        p.bot_category && ['sports', 'NFL', 'NBA', 'MLB', 'NHL'].includes(p.bot_category)
+      ));
+    }
+
+    // Query picks table if it exists
+    const { data: tablePicks, error: picksError } = await supabase
+      .from('picks')
+      .select('*')
+      .gte('confidence', MIN_CONFIDENCE)
+      .eq('game_date', today)
+      .order('confidence', { ascending: false })
+      .limit(10);
+
+    if (!picksError && tablePicks) {
+      picks = picks.concat(tablePicks);
+    }
+
+    // Query progno_predictions for sports
+    const { data: prognoPicks, error: prognoError } = await supabase
+      .from('progno_predictions')
+      .select('*')
+      .gte('confidence', MIN_CONFIDENCE)
+      .gte('created_at', `${today}T00:00:00Z`)
+      .lt('created_at', `${today}T23:59:59Z`)
+      .order('confidence', { ascending: false })
+      .limit(10);
+
+    if (!prognoError && prognoPicks) {
+      picks = picks.concat(prognoPicks.filter(p => 
+        p.category && ['NFL', 'NBA', 'MLB', 'NHL', 'NCAAF', 'NCAAB', 'sports'].includes(p.category)
+      ));
+    }
+
+    if (picks.length === 0) {
+      console.log('No high-confidence sports picks found for today');
+      // Send a message even if no picks
+      const date = new Date().toLocaleDateString('en-US', { 
+        weekday: 'short',
+        month: 'short', 
+        day: 'numeric' 
+      });
+      return `🎯 PROGNO PICKS - ${date}\n\nNo high-confidence picks today (70%+ required).\n\nCheck dashboard for lower confidence options:\nprognostication.ai/picks`;
+    }
+
+    // Format message
+    const date = new Date().toLocaleDateString('en-US', { 
+      weekday: 'short',
+      month: 'short', 
+      day: 'numeric' 
+    });
+
+    let message = `🎯 PROGNO PICKS - ${date}\n\n`;
+
+    // Sort by confidence and take top 5
+    picks.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    picks = picks.slice(0, 5);
+
+    for (const pick of picks) {
+      const sport = pick.sport || pick.bot_category || pick.category || 'Sports';
+      const title = (pick.market_title || pick.question || pick.game_matchup || 'Unknown').substring(0, 40);
+      const prediction = pick.prediction || pick.predicted_outcome || pick.pick_value || 'N/A';
+      const conf = pick.confidence || 0;
+      const edge = pick.edge || pick.edge_pct || 0;
+      
+      message += `${sport}: ${prediction}\n`;
+      message += `  ${title}${title.length >= 40 ? '...' : ''}\n`;
+      message += `  (${conf}% conf${edge > 0 ? `, ${edge.toFixed(1)}% edge` : ''})\n\n`;
+    }
+
+    message += `Full details: prognostication.ai/picks`;
+
+    return message;
+  } catch (error) {
+    console.error("Error generating sports picks:", error);
+    return null;
   }
 }
 
@@ -1275,6 +1430,7 @@ app.listen(CONFIG.PORT, () => {
   
   // Daily briefing at 08:00 CST (14:00 UTC)
   if (process.env.SINCH_API_TOKEN && process.env.MY_PHONE_NUMBER) {
+    // Send system status briefing
     cron.schedule('0 14 * * *', async () => {
       console.log('📱 [CRON] Sending daily briefing SMS...');
       const briefing = await generateDailyBriefing();
@@ -1288,6 +1444,25 @@ app.listen(CONFIG.PORT, () => {
       timezone: "America/Chicago" // CST timezone
     });
     console.log('   📱 SMS Cron: Daily briefing scheduled for 08:00 CST');
+    
+    // Send sports picks at 08:00 CST
+    cron.schedule('0 14 * * *', async () => {
+      console.log('🎯 [CRON] Sending daily sports picks SMS...');
+      const picks = await generateDailySportsPicks();
+      if (picks) {
+        const result = await sendCevictBriefing(process.env.MY_PHONE_NUMBER, picks);
+        if (result.success) {
+          console.log('✅ Daily sports picks sent successfully');
+        } else {
+          console.error('❌ Failed to send sports picks:', result.error);
+        }
+      } else {
+        console.log('⚠️ No sports picks to send today');
+      }
+    }, {
+      timezone: "America/Chicago" // CST timezone
+    });
+    console.log('   🎯 SMS Cron: Daily sports picks scheduled for 08:00 CST');
   } else {
     console.log('   ⚠️  SMS Cron: Not configured (missing SINCH_API_TOKEN or MY_PHONE_NUMBER)');
   }
