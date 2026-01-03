@@ -722,6 +722,199 @@ app.get('/api/activity-log', (req, res) => {
 });
 
 // ============================================
+// TRADER CONTROL & RISK SETTINGS (Live Control)
+// ============================================
+
+// In-memory trader state (also stored in Supabase for persistence)
+let traderState = {
+  isRunning: true,
+  lastStarted: new Date().toISOString(),
+  lastStopped: null,
+  riskSettings: {
+    minConfidence: 60,
+    minEdge: 1,
+    maxTradeSize: 10,
+    dailySpendingLimit: 100,
+    dailyLossLimit: 750,
+    maxOpenPositions: 5
+  }
+};
+
+// Initialize from Supabase on startup
+async function loadTraderState() {
+  try {
+    const { data } = await supabase
+      .from('trader_config')
+      .select('*')
+      .eq('id', 'alpha-hunter')
+      .single();
+    
+    if (data) {
+      traderState = {
+        isRunning: data.is_running ?? true,
+        lastStarted: data.last_started,
+        lastStopped: data.last_stopped,
+        riskSettings: data.risk_settings || traderState.riskSettings
+      };
+      console.log('[Trader Control] Loaded state from Supabase');
+    }
+  } catch (e) {
+    console.log('[Trader Control] Using default state');
+  }
+}
+loadTraderState();
+
+// GET /api/trader/status - Get trader status and risk settings
+app.get('/api/trader/status', async (req, res) => {
+  // Get latest stats from activity log
+  const recentTrades = activityLog.entries.filter(e => e.type === 'trade').length;
+  const recentErrors = activityLog.entries.filter(e => e.type === 'error').length;
+  const lastActivity = activityLog.entries[0]?.timestamp || null;
+  
+  res.json({
+    isRunning: traderState.isRunning,
+    lastStarted: traderState.lastStarted,
+    lastStopped: traderState.lastStopped,
+    riskSettings: traderState.riskSettings,
+    stats: {
+      recentTrades,
+      recentErrors,
+      lastActivity
+    }
+  });
+});
+
+// POST /api/trader/start - Start the trader
+app.post('/api/trader/start', async (req, res) => {
+  if (traderState.isRunning) {
+    return res.json({ success: true, message: 'Trader already running' });
+  }
+  
+  traderState.isRunning = true;
+  traderState.lastStarted = new Date().toISOString();
+  
+  // Persist to Supabase
+  await supabase
+    .from('trader_config')
+    .upsert({
+      id: 'alpha-hunter',
+      is_running: true,
+      last_started: traderState.lastStarted,
+      risk_settings: traderState.riskSettings
+    });
+  
+  // Log the action
+  activityLog.entries.unshift({
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    type: 'info',
+    message: '▶️ Trader STARTED via dashboard',
+    data: { action: 'start', by: 'dashboard' }
+  });
+  
+  console.log('[Trader Control] ▶️ Trader STARTED');
+  res.json({ success: true, message: 'Trader started', state: traderState });
+});
+
+// POST /api/trader/stop - Stop the trader (graceful)
+app.post('/api/trader/stop', async (req, res) => {
+  if (!traderState.isRunning) {
+    return res.json({ success: true, message: 'Trader already stopped' });
+  }
+  
+  traderState.isRunning = false;
+  traderState.lastStopped = new Date().toISOString();
+  
+  // Persist to Supabase
+  await supabase
+    .from('trader_config')
+    .upsert({
+      id: 'alpha-hunter',
+      is_running: false,
+      last_stopped: traderState.lastStopped,
+      risk_settings: traderState.riskSettings
+    });
+  
+  // Log the action
+  activityLog.entries.unshift({
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    type: 'info',
+    message: '⏹️ Trader STOPPED via dashboard',
+    data: { action: 'stop', by: 'dashboard' }
+  });
+  
+  console.log('[Trader Control] ⏹️ Trader STOPPED');
+  res.json({ success: true, message: 'Trader stopped', state: traderState });
+});
+
+// GET /api/trader/risk - Get risk settings
+app.get('/api/trader/risk', (req, res) => {
+  res.json(traderState.riskSettings);
+});
+
+// POST /api/trader/risk - Update risk settings
+app.post('/api/trader/risk', async (req, res) => {
+  const { minConfidence, minEdge, maxTradeSize, dailySpendingLimit, dailyLossLimit, maxOpenPositions } = req.body;
+  
+  // Validate inputs
+  const updates = {};
+  if (minConfidence !== undefined) {
+    const val = parseInt(minConfidence);
+    if (val >= 50 && val <= 95) updates.minConfidence = val;
+  }
+  if (minEdge !== undefined) {
+    const val = parseFloat(minEdge);
+    if (val >= 0.5 && val <= 10) updates.minEdge = val;
+  }
+  if (maxTradeSize !== undefined) {
+    const val = parseInt(maxTradeSize);
+    if (val >= 1 && val <= 100) updates.maxTradeSize = val;
+  }
+  if (dailySpendingLimit !== undefined) {
+    const val = parseInt(dailySpendingLimit);
+    if (val >= 10 && val <= 1000) updates.dailySpendingLimit = val;
+  }
+  if (dailyLossLimit !== undefined) {
+    const val = parseInt(dailyLossLimit);
+    if (val >= 10 && val <= 5000) updates.dailyLossLimit = val;
+  }
+  if (maxOpenPositions !== undefined) {
+    const val = parseInt(maxOpenPositions);
+    if (val >= 1 && val <= 20) updates.maxOpenPositions = val;
+  }
+  
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ success: false, error: 'No valid updates provided' });
+  }
+  
+  // Apply updates
+  traderState.riskSettings = { ...traderState.riskSettings, ...updates };
+  
+  // Persist to Supabase
+  await supabase
+    .from('trader_config')
+    .upsert({
+      id: 'alpha-hunter',
+      is_running: traderState.isRunning,
+      risk_settings: traderState.riskSettings,
+      updated_at: new Date().toISOString()
+    });
+  
+  // Log the change
+  activityLog.entries.unshift({
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    type: 'info',
+    message: `⚙️ Risk settings updated: ${JSON.stringify(updates)}`,
+    data: { action: 'risk_update', updates }
+  });
+  
+  console.log('[Trader Control] ⚙️ Risk settings updated:', updates);
+  res.json({ success: true, message: 'Risk settings updated', settings: traderState.riskSettings });
+});
+
+// ============================================
 // SMS INBOUND WEBHOOK (Sinch)
 // ============================================
 
@@ -1095,7 +1288,7 @@ async function generateDailySportsPicks() {
         month: 'short', 
         day: 'numeric' 
       });
-      return `🎯 PROGNO PICKS - ${date}\n\nNo high-confidence picks today (70%+ required).\n\nCheck dashboard for lower confidence options:\nprognostication.ai/picks`;
+      return `🎯 PROGNO PICKS - ${date}\n\nNo high-confidence picks today (70%+ required).\n\nCheck dashboard for lower confidence options:\nprognostication.com/picks`;
     }
 
     // Format message
@@ -1123,7 +1316,7 @@ async function generateDailySportsPicks() {
       message += `  (${conf}% conf${edge > 0 ? `, ${edge.toFixed(1)}% edge` : ''})\n\n`;
     }
 
-    message += `Full details: prognostication.ai/picks`;
+    message += `\n📱 Full details: prognostication.com`;
 
     return message;
   } catch (error) {
@@ -1203,6 +1396,97 @@ app.get('/dashboard.html', dashboardAuth, async (req, res) => {
       <button id="feedToggle" onclick="toggleFeed()" class="bg-purple-600 hover:bg-purple-700 px-3 py-1 rounded text-sm">
         📺 Live Feed
       </button>
+      <button onclick="toggleControls()" class="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm">
+        ⚙️ Controls
+      </button>
+    </div>
+  </div>
+  
+  <!-- TRADER CONTROL PANEL -->
+  <div id="controlPanel" class="bg-gray-800 rounded-lg p-4 mb-4" style="display: none;">
+    <div class="flex justify-between items-center mb-3">
+      <h2 class="text-lg font-bold">🎮 Trader Control Panel</h2>
+      <div class="flex items-center gap-2">
+        <span id="traderStatus" class="px-2 py-1 rounded text-xs font-bold">Loading...</span>
+      </div>
+    </div>
+    
+    <!-- Start/Stop Buttons -->
+    <div class="flex gap-3 mb-4">
+      <button id="btnStart" onclick="startTrader()" class="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-3 rounded-lg font-bold text-lg transition-all">
+        ▶️ START
+      </button>
+      <button id="btnStop" onclick="stopTrader()" class="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed py-3 rounded-lg font-bold text-lg transition-all">
+        ⏹️ STOP
+      </button>
+    </div>
+    
+    <!-- Risk Settings -->
+    <div class="border-t border-gray-700 pt-3">
+      <h3 class="text-sm font-bold mb-3 text-yellow-400">⚡ Risk Settings (Live)</h3>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+        <!-- Min Confidence -->
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Min Confidence</label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="riskConfidence" min="50" max="95" value="60" class="flex-1 accent-yellow-500" oninput="updateRiskLabel('Confidence')">
+            <span id="riskConfidenceLabel" class="text-sm font-mono w-12 text-right">60%</span>
+          </div>
+        </div>
+        
+        <!-- Min Edge -->
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Min Edge</label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="riskEdge" min="5" max="100" value="10" class="flex-1 accent-yellow-500" oninput="updateRiskLabel('Edge')">
+            <span id="riskEdgeLabel" class="text-sm font-mono w-12 text-right">1.0%</span>
+          </div>
+        </div>
+        
+        <!-- Max Trade Size -->
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Max Trade Size</label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="riskTradeSize" min="1" max="50" value="10" class="flex-1 accent-green-500" oninput="updateRiskLabel('TradeSize')">
+            <span id="riskTradeSizeLabel" class="text-sm font-mono w-12 text-right">$10</span>
+          </div>
+        </div>
+        
+        <!-- Daily Limit -->
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Daily Limit</label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="riskDailyLimit" min="10" max="500" value="100" step="10" class="flex-1 accent-blue-500" oninput="updateRiskLabel('DailyLimit')">
+            <span id="riskDailyLimitLabel" class="text-sm font-mono w-12 text-right">$100</span>
+          </div>
+        </div>
+        
+        <!-- Loss Limit -->
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Loss Limit</label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="riskLossLimit" min="50" max="2000" value="750" step="50" class="flex-1 accent-red-500" oninput="updateRiskLabel('LossLimit')">
+            <span id="riskLossLimitLabel" class="text-sm font-mono w-12 text-right">$750</span>
+          </div>
+        </div>
+        
+        <!-- Max Positions -->
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Max Positions</label>
+          <div class="flex items-center gap-2">
+            <input type="range" id="riskMaxPositions" min="1" max="15" value="5" class="flex-1 accent-purple-500" oninput="updateRiskLabel('MaxPositions')">
+            <span id="riskMaxPositionsLabel" class="text-sm font-mono w-12 text-right">5</span>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Apply Button -->
+      <div class="mt-4 flex justify-between items-center">
+        <span id="riskStatus" class="text-xs text-gray-500"></span>
+        <button onclick="applyRiskSettings()" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded font-bold">
+          💾 Apply Changes
+        </button>
+      </div>
     </div>
   </div>
   
@@ -1251,8 +1535,155 @@ app.get('/dashboard.html', dashboardAuth, async (req, res) => {
   <script>
     const API_KEY = '${key}';
     let feedVisible = true;
+    let controlsVisible = false;
     let lastLogId = null;
     let stats = { trades: 0, analysis: 0, errors: 0, total: 0 };
+    let traderIsRunning = true;
+    
+    // TRADER CONTROL FUNCTIONS
+    function toggleControls() {
+      controlsVisible = !controlsVisible;
+      document.getElementById('controlPanel').style.display = controlsVisible ? 'block' : 'none';
+      if (controlsVisible) loadTraderStatus();
+    }
+    
+    async function loadTraderStatus() {
+      try {
+        const res = await fetch('/api/trader/status', {
+          headers: { 'x-admin-key': API_KEY }
+        });
+        const data = await res.json();
+        traderIsRunning = data.isRunning;
+        
+        // Update status badge
+        const statusEl = document.getElementById('traderStatus');
+        if (traderIsRunning) {
+          statusEl.textContent = '● RUNNING';
+          statusEl.className = 'px-2 py-1 rounded text-xs font-bold bg-green-600';
+        } else {
+          statusEl.textContent = '● STOPPED';
+          statusEl.className = 'px-2 py-1 rounded text-xs font-bold bg-red-600';
+        }
+        
+        // Update buttons
+        document.getElementById('btnStart').disabled = traderIsRunning;
+        document.getElementById('btnStop').disabled = !traderIsRunning;
+        
+        // Load risk settings
+        const settings = data.riskSettings;
+        document.getElementById('riskConfidence').value = settings.minConfidence;
+        document.getElementById('riskConfidenceLabel').textContent = settings.minConfidence + '%';
+        
+        document.getElementById('riskEdge').value = settings.minEdge * 10;
+        document.getElementById('riskEdgeLabel').textContent = settings.minEdge.toFixed(1) + '%';
+        
+        document.getElementById('riskTradeSize').value = settings.maxTradeSize;
+        document.getElementById('riskTradeSizeLabel').textContent = '$' + settings.maxTradeSize;
+        
+        document.getElementById('riskDailyLimit').value = settings.dailySpendingLimit;
+        document.getElementById('riskDailyLimitLabel').textContent = '$' + settings.dailySpendingLimit;
+        
+        document.getElementById('riskLossLimit').value = settings.dailyLossLimit;
+        document.getElementById('riskLossLimitLabel').textContent = '$' + settings.dailyLossLimit;
+        
+        document.getElementById('riskMaxPositions').value = settings.maxOpenPositions;
+        document.getElementById('riskMaxPositionsLabel').textContent = settings.maxOpenPositions;
+        
+      } catch (e) {
+        console.error('Failed to load trader status:', e);
+      }
+    }
+    
+    async function startTrader() {
+      try {
+        const res = await fetch('/api/trader/start', {
+          method: 'POST',
+          headers: { 'x-admin-key': API_KEY }
+        });
+        const data = await res.json();
+        document.getElementById('riskStatus').textContent = '✅ ' + data.message;
+        loadTraderStatus();
+        loadFeed();
+      } catch (e) {
+        document.getElementById('riskStatus').textContent = '❌ Failed to start';
+      }
+    }
+    
+    async function stopTrader() {
+      if (!confirm('⚠️ Stop the trader? This will halt all trading activity.')) return;
+      
+      try {
+        const res = await fetch('/api/trader/stop', {
+          method: 'POST',
+          headers: { 'x-admin-key': API_KEY }
+        });
+        const data = await res.json();
+        document.getElementById('riskStatus').textContent = '⏹️ ' + data.message;
+        loadTraderStatus();
+        loadFeed();
+      } catch (e) {
+        document.getElementById('riskStatus').textContent = '❌ Failed to stop';
+      }
+    }
+    
+    function updateRiskLabel(field) {
+      const slider = document.getElementById('risk' + field);
+      const label = document.getElementById('risk' + field + 'Label');
+      const val = parseFloat(slider.value);
+      
+      switch(field) {
+        case 'Confidence':
+          label.textContent = val + '%';
+          break;
+        case 'Edge':
+          label.textContent = (val / 10).toFixed(1) + '%';
+          break;
+        case 'TradeSize':
+        case 'DailyLimit':
+        case 'LossLimit':
+          label.textContent = '$' + val;
+          break;
+        case 'MaxPositions':
+          label.textContent = val;
+          break;
+      }
+    }
+    
+    async function applyRiskSettings() {
+      const settings = {
+        minConfidence: parseInt(document.getElementById('riskConfidence').value),
+        minEdge: parseFloat(document.getElementById('riskEdge').value) / 10,
+        maxTradeSize: parseInt(document.getElementById('riskTradeSize').value),
+        dailySpendingLimit: parseInt(document.getElementById('riskDailyLimit').value),
+        dailyLossLimit: parseInt(document.getElementById('riskLossLimit').value),
+        maxOpenPositions: parseInt(document.getElementById('riskMaxPositions').value)
+      };
+      
+      try {
+        const res = await fetch('/api/trader/risk', {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'x-admin-key': API_KEY 
+          },
+          body: JSON.stringify(settings)
+        });
+        const data = await res.json();
+        
+        if (data.success) {
+          document.getElementById('riskStatus').textContent = '✅ Settings applied!';
+          setTimeout(() => {
+            document.getElementById('riskStatus').textContent = '';
+          }, 3000);
+        } else {
+          document.getElementById('riskStatus').textContent = '❌ ' + (data.error || 'Failed');
+        }
+        
+        loadFeed(); // Refresh to see the log entry
+      } catch (e) {
+        document.getElementById('riskStatus').textContent = '❌ Failed to apply settings';
+      }
+    }
     
     function toggleFeed() {
       feedVisible = !feedVisible;
